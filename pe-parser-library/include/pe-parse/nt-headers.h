@@ -445,6 +445,22 @@ struct import_dir_entry {
   std::uint32_t AddressRVA;
 };
 
+// Delay-load import descriptor (IMAGE_DELAYLOAD_DESCRIPTOR / ImgDelayDescr).
+// All address fields are 32-bit DWORDs in both PE32 and PE32+.
+// When grAttrs bit 0 is set the fields are RVAs; otherwise they are virtual
+// addresses (legacy format), and the image base must be subtracted to obtain
+// the RVA.
+struct img_delay_descr {
+  std::uint32_t grAttrs;       // attributes; bit 0 set => fields are RVAs
+  std::uint32_t szName;        // RVA/VA of the DLL name string
+  std::uint32_t phmod;         // RVA/VA of the module handle storage
+  std::uint32_t pIAT;          // RVA/VA of the import address table
+  std::uint32_t pINT;          // RVA/VA of the import name table
+  std::uint32_t pBoundIAT;     // RVA/VA of the bound import address table
+  std::uint32_t pUnloadIAT;    // RVA/VA of the unload address table
+  std::uint32_t dwTimeStamp;   // 0 if not bound; timestamp of bound image
+};
+
 struct export_dir_table {
   std::uint32_t ExportFlags;
   std::uint32_t TimeDateStamp;

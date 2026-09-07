@@ -141,6 +141,7 @@ struct parsed_pe_internal {
   std::vector<section> secs;
   std::vector<resource> rsrcs;
   std::vector<importent> imports;
+  std::vector<importent> delay_imports;
   std::vector<reloc> relocs;
   std::vector<exportent> exports;
   std::vector<symbol> symbols;
@@ -2216,6 +2217,186 @@ bool getImports(parsed_pe *p) {
   return true;
 }
 
+bool getDelayImports(parsed_pe *p) {
+  data_directory delayDir;
+  VA imageBase;
+  if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
+    delayDir = p->peHeader.nt.OptionalHeader.DataDirectory[DIR_DELAY_IMPORT];
+    imageBase = p->peHeader.nt.OptionalHeader.ImageBase;
+  } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
+    delayDir = p->peHeader.nt.OptionalHeader64.DataDirectory[DIR_DELAY_IMPORT];
+    imageBase = p->peHeader.nt.OptionalHeader64.ImageBase;
+  } else {
+    return false;
+  }
+
+  if (delayDir.Size == 0 || delayDir.VirtualAddress == 0) {
+    return true;
+  }
+
+  // Locate the section that contains the delay import directory.
+  VA dirVA = rvaToVA(imageBase, delayDir.VirtualAddress);
+  section dirSec;
+  if (!getSecForVA(p->internal->secs, dirVA, dirSec)) {
+    return false;
+  }
+
+  auto offt = static_cast<std::uint32_t>(dirVA - dirSec.sectionBase);
+
+  // Sentinel value used to detect the all-zero terminating descriptor.
+  img_delay_descr emptyDescr;
+  memset(&emptyDescr, 0, sizeof(img_delay_descr));
+
+  do {
+    img_delay_descr desc = emptyDescr;
+
+    READ_DWORD(dirSec.sectionData, offt, desc, grAttrs);
+    READ_DWORD(dirSec.sectionData, offt, desc, szName);
+    READ_DWORD(dirSec.sectionData, offt, desc, phmod);
+    READ_DWORD(dirSec.sectionData, offt, desc, pIAT);
+    READ_DWORD(dirSec.sectionData, offt, desc, pINT);
+    READ_DWORD(dirSec.sectionData, offt, desc, pBoundIAT);
+    READ_DWORD(dirSec.sectionData, offt, desc, pUnloadIAT);
+    READ_DWORD(dirSec.sectionData, offt, desc, dwTimeStamp);
+
+    // All-zero terminator
+    if (desc.szName == 0 && desc.pINT == 0 && desc.pIAT == 0) {
+      break;
+    }
+
+    // Resolve the DLL name RVA/VA.
+    // When grAttrs bit 0 is set the fields are RVAs; otherwise they are
+    // legacy VAs (absolute), so subtract the image base to obtain the RVA.
+    std::uint32_t nameRva;
+    std::uint32_t intRva;
+    std::uint32_t iatRva;
+    if (desc.grAttrs & 1u) {
+      nameRva = desc.szName;
+      intRva = desc.pINT;
+      iatRva = desc.pIAT;
+    } else {
+      // Legacy VA format: subtract image base to get RVA.
+      nameRva = static_cast<std::uint32_t>(desc.szName - imageBase);
+      intRva = static_cast<std::uint32_t>(desc.pINT - imageBase);
+      iatRva = static_cast<std::uint32_t>(desc.pIAT - imageBase);
+    }
+
+    // Read DLL name string.
+    std::string modName;
+    if (!readRvaCString(p->internal->secs, imageBase, nameRva, modName)) {
+      return false;
+    }
+
+    // clang-format off
+    std::transform(
+      modName.begin(),
+      modName.end(),
+      modName.begin(),
+      [](char chr) -> char {
+        return static_cast<char>(::toupper(chr));
+      }
+    );
+    // clang-format on
+
+    // Walk the import name table to enumerate functions.
+    VA lookupVA = rvaToVA(imageBase, intRva);
+    section lookupSec;
+    if (!getSecForVA(p->internal->secs, lookupVA, lookupSec)) {
+      return false;
+    }
+
+    auto lookupOff = static_cast<std::uint32_t>(lookupVA - lookupSec.sectionBase);
+    std::uint32_t offInTable = 0;
+
+    do {
+      VA valVA = 0;
+      std::uint8_t ord = 0;
+      std::uint16_t oval = 0;
+      std::uint32_t val32 = 0;
+      std::uint64_t val64 = 0;
+
+      if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
+        if (!readDword(lookupSec.sectionData, lookupOff, val32)) {
+          return false;
+        }
+        if (val32 == 0) {
+          break;
+        }
+        ord = (val32 >> 31);
+        oval = static_cast<std::uint16_t>(val32 & 0xFFFFu);
+        valVA = static_cast<VA>(val32 & 0x7FFFFFFFu) + imageBase;
+      } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
+        if (!readQword(lookupSec.sectionData, lookupOff, val64)) {
+          return false;
+        }
+        if (val64 == 0) {
+          break;
+        }
+        ord = static_cast<std::uint8_t>(val64 >> 63);
+        oval = static_cast<std::uint16_t>(val64 & 0xFFFFu);
+        valVA = static_cast<VA>(val64 & 0x7FFFFFFFFFFFFFFFull) + imageBase;
+      } else {
+        return false;
+      }
+
+      if (ord == 0) {
+        // Import by name: skip the 2-byte Hint field.
+        std::string symName;
+        section symNameSec;
+
+        if (!getSecForVA(p->internal->secs, valVA, symNameSec)) {
+          return false;
+        }
+
+        std::uint32_t nameOffset =
+            static_cast<std::uint32_t>(valVA - symNameSec.sectionBase) +
+            sizeof(std::uint16_t);
+        do {
+          std::uint8_t chr;
+          if (!readByte(symNameSec.sectionData, nameOffset, chr)) {
+            return false;
+          }
+          if (chr == 0) {
+            break;
+          }
+          symName.push_back(static_cast<char>(chr));
+          nameOffset++;
+        } while (true);
+
+        importent ent;
+        ent.addr = offInTable + rvaToVA(imageBase, iatRva);
+        ent.symbolName = symName;
+        ent.moduleName = modName;
+        p->internal->delay_imports.push_back(ent);
+      } else {
+        // Import by ordinal.
+        std::string symName = "ORDINAL_" + modName + "_" +
+                              to_string<std::uint32_t>(oval, std::dec);
+
+        importent ent;
+        ent.addr = offInTable + rvaToVA(imageBase, iatRva);
+        ent.symbolName = symName;
+        ent.moduleName = modName;
+        p->internal->delay_imports.push_back(ent);
+      }
+
+      if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_32_MAGIC) {
+        lookupOff += sizeof(std::uint32_t);
+        offInTable += sizeof(std::uint32_t);
+      } else if (p->peHeader.nt.OptionalMagic == NT_OPTIONAL_64_MAGIC) {
+        lookupOff += sizeof(std::uint64_t);
+        offInTable += sizeof(std::uint64_t);
+      } else {
+        return false;
+      }
+    } while (true);
+
+    offt += sizeof(img_delay_descr);
+  } while (true);
+
+  return true;
+}
+
 bool getSymbolTable(parsed_pe *p) {
   if (p->peHeader.nt.FileHeader.PointerToSymbolTable == 0) {
     return true;
@@ -2631,6 +2812,13 @@ parsed_pe *ParsePEFromBuffer(bounded_buffer *buffer) {
     return nullptr;
   }
 
+  // Get delay imports
+  if (!getDelayImports(p)) {
+    deleteBuffer(remaining);
+    DestructParsedPE(p);
+    return nullptr;
+  }
+
   // Get symbol table
   if (!getSymbolTable(p)) {
     deleteBuffer(remaining);
@@ -2697,6 +2885,19 @@ void DestructParsedPE(parsed_pe *p) {
 // iterate over the imports by VA and string
 void IterImpVAString(parsed_pe *pe, iterVAStr cb, void *cbd) {
   std::vector<importent> &l = pe->internal->imports;
+
+  for (importent &i : l) {
+    if (cb(cbd, i.addr, i.moduleName, i.symbolName) != 0) {
+      break;
+    }
+  }
+
+  return;
+}
+
+// iterate over the delay imports by VA and string
+void IterDelayImpVAString(parsed_pe *pe, iterVAStr cb, void *cbd) {
+  std::vector<importent> &l = pe->internal->delay_imports;
 
   for (importent &i : l) {
     if (cb(cbd, i.addr, i.moduleName, i.symbolName) != 0) {

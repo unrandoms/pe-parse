@@ -220,6 +220,9 @@ typedef int (*iterVAStr)(void *,
                          const std::string &);
 void IterImpVAString(parsed_pe *pe, iterVAStr cb, void *cbd);
 
+// iterate over the delay imports by RVA and string
+void IterDelayImpVAString(parsed_pe *pe, iterVAStr cb, void *cbd);
+
 // iterate over relocations in the PE file
 typedef int (*iterReloc)(void *, const VA &, const reloc_type &);
 void IterRelocs(parsed_pe *pe, iterReloc cb, void *cbd);
