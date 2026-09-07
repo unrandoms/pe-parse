@@ -970,6 +970,18 @@ static PyObject *pepy_parsed_get_imports(PyObject *self, PyObject *args) {
   return ret;
 }
 
+static PyObject *pepy_parsed_get_delay_imports(PyObject *self, PyObject *args) {
+  PyObject *ret = PyList_New(0);
+  if (!ret) {
+    PyErr_SetString(pepy_error, "Unable to create new list.");
+    return NULL;
+  }
+
+  IterDelayImpVAString(((pepy_parsed *) self)->pe, import_callback, ret);
+
+  return ret;
+}
+
 int export_callback(void *cbd,
                     const VA &addr,
                     const std::string &mod,
@@ -1225,6 +1237,10 @@ static PyMethodDef pepy_parsed_methods[] = {
      pepy_parsed_get_imports,
      METH_NOARGS,
      "Return a list of import objects."},
+    {"get_delay_imports",
+     pepy_parsed_get_delay_imports,
+     METH_NOARGS,
+     "Return a list of delay-load import objects."},
     {"get_exports",
      pepy_parsed_get_exports,
      METH_NOARGS,
